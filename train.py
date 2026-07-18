@@ -92,8 +92,29 @@ def build_model(num_classes: int, device: torch.device) -> nn.Module:
     model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
     for param in model.parameters():
         param.requires_grad = False
-    model.fc = nn.Linear(model.fc.in_features, num_classes)  # only the head trains
+    # Unfreeze the last residual block so the model can adapt mid-level features
+    # to galaxy morphology, not just reuse generic ImageNet features through a
+    # frozen backbone -- a single trainable linear head plateaus quickly (see
+    # v1 run: train/val both flatlined ~60% from epoch 5 on, indicating an
+    # underfitting capacity ceiling, not an overfitting or LR problem).
+    for param in model.layer4.parameters():
+        param.requires_grad = True
+    model.fc = nn.Linear(model.fc.in_features, num_classes)  # always trainable
     return model.to(device)
+
+
+def build_optimizer(model: nn.Module, lr: float) -> torch.optim.Optimizer:
+    """Differential learning rates: the newly-initialized head needs the full
+    lr, but layer4 is pretrained and already close to a good solution, so it
+    only needs gentle fine-tuning (1/10th lr) to avoid destroying those
+    pretrained features."""
+    head_params = list(model.fc.parameters())
+    backbone_params = [p for n, p in model.named_parameters()
+                        if n.startswith("layer4") and p.requires_grad]
+    return torch.optim.Adam([
+        {"params": head_params, "lr": lr},
+        {"params": backbone_params, "lr": lr * 0.1},
+    ])
 
 
 def run_epoch(model, loader, criterion, optimizer, device, train: bool):
@@ -132,7 +153,7 @@ def train_one_fold(train_ds, val_ds, num_classes, device, epochs, lr, batch_size
 
     model = build_model(num_classes, device)
     criterion = nn.CrossEntropyLoss(weight=weights)
-    optimizer = torch.optim.Adam(model.fc.parameters(), lr=lr)
+    optimizer = build_optimizer(model, lr)
 
     for epoch in range(epochs):
         train_loss, train_acc = run_epoch(model, train_loader, criterion, optimizer, device, train=True)
@@ -191,7 +212,7 @@ def main():
         model = build_model(num_classes, device)
         weights = class_weights(targets, num_classes, device)
         criterion = nn.CrossEntropyLoss(weight=weights)
-        optimizer = torch.optim.Adam(model.fc.parameters(), lr=args.lr)
+        optimizer = build_optimizer(model, args.lr)
         for epoch in range(args.epochs):
             loss, acc = run_epoch(model, loader, criterion, optimizer, device, train=True)
             print(f"  epoch {epoch+1:2d}/{args.epochs}  loss={loss:.3f} acc={acc:.3f}")
