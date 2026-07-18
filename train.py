@@ -2,20 +2,23 @@
 train.py
 
 Stratified 5-fold cross-validation, ResNet18 transfer learning, on the
-5-subtype dataset produced by prepare_data.py:
-  spiral_face_on, spiral_barred, spiral_edge_on, elliptical, disk_no_arms
+6-subtype dataset produced by prepare_data.py:
+  elliptical_round, elliptical_inbetween, elliptical_cigar,
+  spiral_face_on, spiral_barred, spiral_edge_on
 
 Every image gets predicted exactly once, by a model that never trained on it,
 so the reported accuracy covers the full dataset rather than one lucky split.
+Class-weighted loss (inverse frequency) is used throughout to counter the
+heavy imbalance toward elliptical_inbetween.
 
 Reports:
-  - Per-fold and mean±std 5-way subtype accuracy
+  - Per-fold and mean±std 6-way subtype accuracy
   - Binary spiral-detection precision/recall (spiral_* classes vs. the rest)
   - Confusion matrix (saved as PNG)
 
 Usage:
-  python train.py --data_dir /workspace/data/subtypes --epochs 15
-  python train.py --data_dir /workspace/data/subtypes --final   # train one deployable model on all data
+  python train.py --data_dir /workspace/data/subtypes_v2 --epochs 15
+  python train.py --data_dir /workspace/data/subtypes_v2 --final   # train one deployable model on all data
 """
 
 import argparse
@@ -46,6 +49,15 @@ def build_transforms(train: bool):
         ]
     ops += [transforms.ToTensor(), transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)]
     return transforms.Compose(ops)
+
+
+def class_weights(targets: np.ndarray, num_classes: int, device: torch.device) -> torch.Tensor:
+    """Inverse-frequency weights so the majority class (elliptical_inbetween etc.)
+    doesn't dominate the loss. weight_c = total_samples / (num_classes * count_c)."""
+    counts = np.bincount(targets, minlength=num_classes).astype(float)
+    counts[counts == 0] = 1  # guard against empty classes
+    weights = len(targets) / (num_classes * counts)
+    return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
 def build_model(num_classes: int, device: torch.device) -> nn.Module:
@@ -86,12 +98,12 @@ def predict(model, loader, device):
     return np.concatenate(preds), np.concatenate(targets_all)
 
 
-def train_one_fold(train_ds, val_ds, num_classes, device, epochs, lr, batch_size):
+def train_one_fold(train_ds, val_ds, num_classes, device, epochs, lr, batch_size, weights):
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4)
 
     model = build_model(num_classes, device)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(weight=weights)
     optimizer = torch.optim.Adam(model.fc.parameters(), lr=lr)
 
     for epoch in range(epochs):
@@ -105,7 +117,7 @@ def train_one_fold(train_ds, val_ds, num_classes, device, epochs, lr, batch_size
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", default="/workspace/data/subtypes")
+    parser.add_argument("--data_dir", default="/workspace/data/subtypes_v2")
     parser.add_argument("--out_dir", default="/workspace/checkpoints")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--folds", type=int, default=5)
@@ -149,7 +161,8 @@ def main():
         train_ds.transform = build_transforms(train=True)
         loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4)
         model = build_model(num_classes, device)
-        criterion = nn.CrossEntropyLoss()
+        weights = class_weights(targets, num_classes, device)
+        criterion = nn.CrossEntropyLoss(weight=weights)
         optimizer = torch.optim.Adam(model.fc.parameters(), lr=args.lr)
         for epoch in range(args.epochs):
             loss, acc = run_epoch(model, loader, criterion, optimizer, device, train=True)
@@ -173,8 +186,11 @@ def main():
         )
         val_subset = Subset(full_dataset, val_idx)
 
+        fold_weights = class_weights(targets[train_idx], num_classes, device)
+
         model, val_loader = train_one_fold(
-            train_subset, val_subset, num_classes, device, args.epochs, args.lr, args.batch_size
+            train_subset, val_subset, num_classes, device, args.epochs, args.lr, args.batch_size,
+            fold_weights
         )
         preds, fold_targets = predict(model, val_loader, device)
         all_preds[val_idx] = preds
@@ -186,8 +202,9 @@ def main():
     elapsed = time.time() - start
     print(f"\nTotal CV time: {elapsed/60:.1f} min")
 
+    # Every image now has an out-of-fold prediction -> full-dataset metrics
     overall_acc = accuracy_score(targets, all_preds)
-    print(f"\n=== 5-way subtype accuracy (out-of-fold, full dataset) ===")
+    print(f"\n=== 6-way subtype accuracy (out-of-fold, full dataset) ===")
     print(f"Mean fold accuracy: {np.mean(fold_accuracies):.4f} +/- {np.std(fold_accuracies):.4f}")
     print(f"Overall (pooled)   : {overall_acc:.4f}")
 

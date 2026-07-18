@@ -1,27 +1,35 @@
 """
 prepare_data.py
 
-Builds a 5-subtype spiral-detection dataset from the galaxy-datasets GZ2 catalog.
+Builds a 6-subtype galaxy morphology dataset from the galaxy-datasets GZ2 catalog.
 
 Input:  the pandas catalog + label_cols returned by `galaxy_datasets.gz2(...)`
         (vote COUNTS per answer, e.g. 'smooth-or-featured-gz2_smooth')
-Output: <out_dir>/{spiral_face_on,spiral_barred,spiral_edge_on,elliptical,disk_no_arms}/*.jpg
+Output: <out_dir>/{elliptical_round,elliptical_inbetween,elliptical_cigar,
+                   spiral_face_on,spiral_barred,spiral_edge_on}/*.jpg
         (symlinks to the original images, so this is fast and doesn't duplicate 3GB of data)
 
-GZ2 decision tree logic used here:
-  smooth-or-featured: smooth vs featured-or-disk vs artifact
-    -> smooth (high frac)                                => elliptical
-    -> featured-or-disk (high frac):
-         disk-edge-on: yes (high frac)                    => spiral_edge_on
-         disk-edge-on: no (high frac):
-              has-spiral-arms: no (high frac)              => disk_no_arms
-              has-spiral-arms: yes (high frac):
-                   bar: yes (high frac)                    => spiral_barred
-                   bar: no (high frac)                     => spiral_face_on
+GZ2 decision tree logic used here (all splits CONDITIONED on their parent node,
+same hierarchical/confidence-threshold design used throughout this project):
 
-Each branch requires BOTH the parent answer's fraction AND the child answer's
-fraction to clear --threshold, and a minimum vote count (--min_votes) so a
-galaxy with 3 total votes can't produce a "confident" label by chance.
+  smooth-or-featured: smooth vs featured-or-disk vs artifact
+    -> smooth (high frac):
+         how-rounded: round (high frac)                    => elliptical_round
+         how-rounded: in-between (high frac)                => elliptical_inbetween
+         how-rounded: cigar (high frac)                     => elliptical_cigar
+    -> featured-or-disk (high frac):
+         disk-edge-on: yes (high frac)                     => spiral_edge_on
+         disk-edge-on: no (high frac):
+              has-spiral-arms: no (high frac)               => (dropped: too few examples)
+              has-spiral-arms: yes (high frac):
+                   bar: yes (high frac)                     => spiral_barred
+                   bar: no (high frac)                      => spiral_face_on
+
+Each branch requires the PARENT node's fraction AND the child answer's own
+fraction to both clear --threshold, plus a minimum vote count (--min_votes)
+so a galaxy with 3 total votes can't produce a "confident" label by chance.
+The disk_no_arms leaf is intentionally excluded (~168 images at threshold=0.8,
+too few for reliable 5-fold CV).
 """
 
 import argparse
@@ -48,6 +56,7 @@ def build_labels(catalog: pd.DataFrame, threshold: float, min_votes: int) -> pd.
     edge_cols = ["disk-edge-on-gz2_yes", "disk-edge-on-gz2_no"]
     spiral_cols = ["has-spiral-arms-gz2_yes", "has-spiral-arms-gz2_no"]
     bar_cols = ["bar-gz2_yes", "bar-gz2_no"]
+    round_cols = ["how-rounded-gz2_round", "how-rounded-gz2_in-between", "how-rounded-gz2_cigar"]
 
     f_smooth = fraction(catalog, smooth_cols, "smooth-or-featured-gz2_smooth")
     f_featured = fraction(catalog, smooth_cols, "smooth-or-featured-gz2_featured-or-disk")
@@ -57,14 +66,28 @@ def build_labels(catalog: pd.DataFrame, threshold: float, min_votes: int) -> pd.
     f_spiral_no = fraction(catalog, spiral_cols, "has-spiral-arms-gz2_no")
     f_bar_yes = fraction(catalog, bar_cols, "bar-gz2_yes")
     f_bar_no = fraction(catalog, bar_cols, "bar-gz2_no")
+    f_round = fraction(catalog, round_cols, "how-rounded-gz2_round")
+    f_inbetween = fraction(catalog, round_cols, "how-rounded-gz2_in-between")
+    f_cigar = fraction(catalog, round_cols, "how-rounded-gz2_cigar")
 
     total_votes = catalog[smooth_cols].sum(axis=1)
     enough_votes = total_votes >= min_votes
 
     label = pd.Series(index=catalog.index, dtype=object)
 
-    elliptical = enough_votes & (f_smooth >= threshold)
-    label[elliptical] = "elliptical"
+    # Elliptical branch: conditioned on smooth, then split by shape (round/in-between/cigar).
+    # Conditioning here mirrors the spiral branch below -- every leaf label requires its
+    # parent node's fraction AND its own fraction to both clear --threshold.
+    smooth = enough_votes & (f_smooth >= threshold)
+
+    ell_round = smooth & (f_round >= threshold)
+    label[ell_round] = "elliptical_round"
+
+    ell_inbetween = smooth & (f_inbetween >= threshold)
+    label[ell_inbetween] = "elliptical_inbetween"
+
+    ell_cigar = smooth & (f_cigar >= threshold)
+    label[ell_cigar] = "elliptical_cigar"
 
     featured = enough_votes & (f_featured >= threshold)
 
@@ -73,8 +96,8 @@ def build_labels(catalog: pd.DataFrame, threshold: float, min_votes: int) -> pd.
 
     not_edge_on = featured & (f_edge_no >= threshold)
 
-    no_arms = not_edge_on & (f_spiral_no >= threshold)
-    label[no_arms] = "disk_no_arms"
+    # has-spiral-arms=no (disk_no_arms leaf) intentionally left unlabeled -- too few
+    # examples (~168 at threshold=0.8) for reliable 5-fold CV.
 
     has_arms = not_edge_on & (f_spiral_yes >= threshold)
 
