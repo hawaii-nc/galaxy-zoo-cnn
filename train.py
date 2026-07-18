@@ -60,6 +60,34 @@ def class_weights(targets: np.ndarray, num_classes: int, device: torch.device) -
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
+class TransformSubset(torch.utils.data.Dataset):
+    """Wraps a fixed list of (path, label) samples with a given transform.
+
+    Used instead of re-instantiating ImageFolder per fold: re-scanning the
+    directory from disk for each fold risks index misalignment whenever the
+    in-memory sample list has been filtered (e.g. --max_per_class), since a
+    fresh ImageFolder always re-scans the FULL unfiltered directory. Building
+    every fold's Dataset from the same already-filtered `samples` list makes
+    train/val indices always refer to the same underlying images regardless
+    of filtering.
+    """
+
+    def __init__(self, samples, loader, transform):
+        self.samples = samples
+        self.loader = loader
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, target = self.samples[idx]
+        image = self.loader(path)
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, target
+
+
 def build_model(num_classes: int, device: torch.device) -> nn.Module:
     model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
     for param in model.parameters():
@@ -181,9 +209,8 @@ def main():
         print(f"\n=== Fold {fold+1}/{args.folds} "
               f"(train={len(train_idx)}, val={len(val_idx)}) ===")
 
-        train_subset = Subset(
-            datasets.ImageFolder(args.data_dir, transform=build_transforms(train=True)), train_idx
-        )
+        train_samples = [full_dataset.samples[i] for i in train_idx]
+        train_subset = TransformSubset(train_samples, full_dataset.loader, build_transforms(train=True))
         val_subset = Subset(full_dataset, val_idx)
 
         fold_weights = class_weights(targets[train_idx], num_classes, device)
